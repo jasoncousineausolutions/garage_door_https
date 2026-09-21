@@ -1,0 +1,18 @@
+{
+  "web": {
+    "username": "admin",
+    "password": "must match web_password in secrets.yaml",
+    "certPinSha256": "value printed by make-cert.sh",
+    "localUrl": "https://192.168.1.50",
+    "localSubnets": ["192.168.1."],
+    "internetUrl": "https://your-name.duckdns.org:12345",
+    "doorStatusId": "door_status",
+    "pressButtonId": "press_button"
+  },
+  "bluetooth": {
+    "deviceName": "garagedoor",
+    "serviceUuid": "40623379-b09a-4536-a3f8-7643c85f39cf",
+    "triggerUuid": "a55d5ca3-ad03-4b27-ac70-2dfc8918c74b",
+    "secret": "must match ble_secret in secrets.yaml"
+  }
+}

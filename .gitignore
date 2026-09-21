@@ -1,0 +1,37 @@
+# =============================================================================
+# Secrets and keys. NEVER commit any of these.
+#
+# If one is ever committed by mistake, deleting it in a later commit is NOT
+# enough - it stays in the repository history. Treat it as leaked and rotate it.
+# =============================================================================
+
+# Device credentials (WiFi, web login, BLE secret, API key)
+secrets.yaml
+
+# TLS certificate and PRIVATE KEY, and the header that embeds the private key
+# into the firmware. cert.h contains key.pem verbatim.
+cert.pem
+key.pem
+**/cert.h
+
+# Certificate generation settings (contains your IP and hostname)
+cert-config
+
+# The app's working config, if you keep a copy alongside
+**/config.json
+my-config.json
+
+# =============================================================================
+# Build output
+# =============================================================================
+.esphome/
+*.bin
+*.elf
+
+# Python virtual environment created by reflash.sh
+esphome-venv/
+__pycache__/
+*.pyc
+
+# Logs from `esphome logs ... | tee`
+*.log

@@ -1,0 +1,410 @@
+# =============================================================================
+# Garage Door Opener
+#
+# Hardware:  ESP32-S3 (DevKitC-1, WROOM-1 N16R8: 16MB flash, 8MB PSRAM)
+#            + 5V relay + 2 lever microswitches
+#            Relay is wired across the wall-button terminals of the opener,
+#            so a brief pulse is exactly equivalent to pressing that button.
+#
+#            PSRAM is REQUIRED, not optional - see the psram: section.
+#
+# Control:   1. Browser  -> ESPHome's web UI over HTTPS on port 443
+#            2. Android  -> polls the same HTTPS endpoints, no persistent
+#                           connection held open
+#            3. Bluetooth-> BLE GATT write, works with WiFi completely down
+#
+# HTTPS:     ESPHome's web_server cannot do TLS. components/web_server_idf/ is
+#            a local fork that starts an SSL server instead of a plain one, with
+#            a self-signed certificate embedded at compile time. See the
+#            external_components: section and that component's README.
+#
+# Design notes:
+#   The device has a hard limit of 16 network sockets in total, and the HTTP
+#   server gets a small share of those. Everything below is deliberate about not
+#   wasting them. Anything that holds a socket open permanently has to justify
+#   itself.
+# =============================================================================
+
+substitutions:
+  # The BLE secret is compared inside a C++ lambda further down. !secret cannot
+  # be used there - it resolves at YAML level and doesn't reach into lambda
+  # source - but substitutions are textual and do. So it is pulled from
+  # secrets.yaml here and substituted into the lambda as ${ble_secret}.
+  ble_secret: !secret ble_secret
+
+esphome:
+  name: garagedoor
+  friendly_name: Garage Door
+  on_boot:
+    # Brief pause before working out the status. Not for contact bounce - a
+    # lever microswitch settles in a few milliseconds. It's because the 50ms
+    # debounce filters below mean a switch's first reading isn't available the
+    # instant this runs, and reading too early yields "Partly Open" on a door
+    # that isn't. 250ms is 5x the filter window, which covers scheduling jitter.
+    priority: -100
+    then:
+      - delay: 250ms
+      - component.update: door_status
+
+# -----------------------------------------------------------------------------
+# Local component overrides
+# -----------------------------------------------------------------------------
+# ESPHome's web_server has no TLS support (upstream feature request #2432, open
+# since 2023). components/web_server_idf/ is a fork of the stock component that
+# starts an HTTPS server instead of a plain one. Naming it identically to the
+# built-in component makes ESPHome use ours in its place.
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [web_server_idf]
+
+esp32:
+  board: esp32-s3-devkitc-1
+  # N16R8 module: 16MB flash. Without this ESPHome assumes 4MB and the
+  # partition table won't match the hardware.
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    # No version pin - ESPHome's recommended ESP-IDF version is used.
+    #
+    # If the device bootloops with an assert mentioning
+    # "s_prepare_reserved_regions memory_layout_utils.c", that is a known
+    # ESP-IDF memory-layout bug triggered by enabling Bluetooth. Pinning
+    # version: "5.3.2" here avoids it.
+    sdkconfig_options:
+      # Default is 10 sockets TOTAL for the whole device - WiFi internals, the
+      # API, OTA, the web server listener, and every connected client share one
+      # pool. Running out shows up as "httpd_accept_conn: error in accept (23)"
+      # (ENFILE) and the server silently stops accepting connections.
+      # 16 is the maximum ESP-IDF permits. Changing this forces a full rebuild.
+      CONFIG_LWIP_MAX_SOCKETS: "16"
+
+      # REQUIRED. Do not remove.
+      #
+      # Without it mbedTLS takes its 30-40KB handshake buffers from internal
+      # RAM. They are freed and reallocated on every handshake, and the
+      # resulting fragmentation is permanent - the largest free block falls
+      # steadily until no handshake can complete, at which point the device
+      # looks healthy but refuses every TLS connection.
+      #
+      # This sends those allocations to PSRAM instead, leaving the internal
+      # heap untouched by TLS. It is the single option that makes HTTPS on this
+      # hardware viable.
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+
+# -----------------------------------------------------------------------------
+# PSRAM
+# -----------------------------------------------------------------------------
+# REQUIRED for HTTPS. TLS allocations are redirected here rather than to the
+# internal heap (see CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC above); without external
+# RAM to redirect them to, that option has nowhere to put them and repeated
+# handshakes fragment internal memory until the server stops working.
+#
+# "octal" is correct for the R8 module. It is also why GPIO35/36/37 are
+# unusable on this board - the octal PSRAM interface occupies them.
+psram:
+  mode: octal
+  speed: 80MHz
+
+# -----------------------------------------------------------------------------
+# Network
+# -----------------------------------------------------------------------------
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  manual_ip:
+    static_ip: !secret device_ip
+    gateway: !secret network_gateway
+    subnet: 255.255.255.0
+    dns1: !secret network_dns
+
+  # If WiFi is unreachable for this long, reboot and try again from scratch.
+  # Kept deliberately: this is the one automatic recovery path for a device that
+  # may not be easy to reach physically.
+  reboot_timeout: 15min
+
+# No fallback AP. Bluetooth already covers "WiFi is down and I'm standing next
+# to the door", and an AP is another radio interface consuming resources.
+
+# No mdns. Nothing resolves "garagedoor.local" - the browser and the app both
+# connect by static IP or through DuckDNS. Frees a socket.
+mdns:
+  disabled: true
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+# Verbose on purpose - diagnosing this remotely has mattered more than saving
+# a few cycles. Read it with:  esphome logs garage_door.yaml
+logger:
+  level: DEBUG
+
+# -----------------------------------------------------------------------------
+# Services
+# -----------------------------------------------------------------------------
+# The API exists ONLY so `esphome logs` works over the network. There is no
+# Home Assistant here. reboot_timeout MUST stay 0s - the default is 15min, and
+# with no HA client ever connecting the device would reboot itself forever.
+# If sockets ever get tight again, this component is the first thing to cut.
+api:
+  encryption:
+    key: !secret api_encryption_key
+  reboot_timeout: 0s
+
+ota:
+  platform: esphome
+
+web_server:
+  # 443 so URLs need no port number, e.g. https://<device_ip>
+  # For access from outside, forward an external port on your router to this one.
+  port: 443
+
+  # Don't stream the device's debug log to connected browsers. Every log line
+  # is a separate write to every open page, and each write is a chance for the
+  # server task to block on a client that has gone away. The logs are available
+  # over the API anyway (esphome logs garage_door.yaml), so this costs
+  # nothing and removes a lot of traffic.
+  log: false
+  # Version 2, not 3. On v3 the page came up blank after every refresh:
+  # entities only appeared when they next published a value, because v3 does
+  # not send a snapshot of current state to a newly-connected client. On a
+  # device that has been up for hours with a door that hasn't moved, that means
+  # nothing shows at all. v2 sends the full current state on connect, so the
+  # page is populated immediately.
+  version: 2
+  auth:
+    username: !secret web_username
+    password: !secret web_password
+
+
+# -----------------------------------------------------------------------------
+# Bluetooth
+# -----------------------------------------------------------------------------
+# Runs on its own radio, independent of WiFi - if WiFi is down, this still
+# works. Exposes exactly one thing: a write-only characteristic that fires the
+# relay if (and only if) the payload matches the shared secret.
+#
+# NOTE: the secret is a shared string, not real BLE encryption. ESPHome's BLE
+# server exposes no pairing or bonding, so this is what's available. It stops
+# casual access from anyone in range with a generic BLE app, and the UUIDs below
+# are not secret - any BLE client that connects can discover them.
+#
+# The secret must match the Android client's configuration. Changing it here
+# means reflashing AND updating every client, and Bluetooth stops working until
+# both agree.
+esp32_ble:
+
+esp32_ble_server:
+  manufacturer: "ESPHome"
+  model: "Garage Door Opener"
+  on_connect:
+    - lambda: 'ESP_LOGI("ble", "Client connected (id %d)", id);'
+  on_disconnect:
+    - lambda: 'ESP_LOGI("ble", "Client disconnected (id %d)", id);'
+  services:
+    - uuid: 40623379-b09a-4536-a3f8-7643c85f39cf
+      characteristics:
+        - id: ble_door_trigger
+          uuid: a55d5ca3-ad03-4b27-ac70-2dfc8918c74b
+          write: true
+          on_write:
+            then:
+              - if:
+                  condition:
+                    lambda: |-
+                      std::string received(x.begin(), x.end());
+                      return received == "${ble_secret}";
+                  then:
+                    - logger.log: "BLE: correct code, pressing button"
+                    - script.execute: fire_relay
+                  else:
+                    - logger.log:
+                        format: "BLE: rejected write (wrong code, %d bytes)"
+                        args: ['x.size()']
+                        level: WARN
+
+# Deliberately NOT exposing door state over BLE. Earlier attempts to push
+# sensor state over BLE notifications reported wrong values consistently, and
+# BLE is the "standing next to the door" fallback - the door itself is visible.
+
+# -----------------------------------------------------------------------------
+# Door status
+# -----------------------------------------------------------------------------
+# Lever switches report honestly: the door is either pressing the lever or it
+# isn't. So the status is a direct reading of the two, with no inference.
+#
+# Worth knowing if you are adapting this: reed switches are a poor fit here.
+# Their magnets often settle just outside detection range once the door stops,
+# so an arrived door reports nothing, and no amount of logic on this side fixes
+# it reliably. Lever switches remove the problem entirely.
+# -----------------------------------------------------------------------------
+# Relay firing (rate limited)
+# -----------------------------------------------------------------------------
+# Every way of triggering the door goes through this script, so the limit is
+# enforced once, centrally - web page, Android app and Bluetooth all use it.
+#
+# mode: single means a second call while this is still running is IGNORED (and
+# logged). So the door cannot be fired more than once per second no matter how
+# many presses arrive, from however many clients. That protects the opener from
+# a double-tap, from two people pressing at once, and from a client retrying.
+script:
+  - id: fire_relay
+    mode: single
+    then:
+      - switch.turn_on: garage_door_relay
+      - delay: 500ms
+      - switch.turn_off: garage_door_relay
+      - delay: 500ms          # cooldown - script stays "running" so further
+                              # calls are dropped for another half second
+
+text_sensor:
+  # Single source of truth for door position. The Android app reads this one
+  # value rather than fetching both switches and working it out itself, so the
+  # browser and every phone always agree.
+  - platform: template
+    id: door_status
+    name: "Door Status"
+    # Recalculated immediately whenever a switch changes (see on_state below),
+    # so this interval is only a safety net. It exists because the debounce
+    # filters mean a switch's state isn't readable the instant the device boots
+    # - without this, a wrong value worked out at startup would stick until the
+    # door next moved.
+    update_interval: 30s
+    lambda: |-
+      const bool closed_on = id(door_fully_closed).state;
+      const bool open_on   = id(door_fully_open).state;
+
+      if (closed_on && open_on) return {"Error"};   // both pressed - wiring fault
+      if (closed_on)            return {"Closed"};
+      if (open_on)              return {"Open"};
+      return {"Partly Open"};                        // travelling, or stopped midway
+
+  # Device identity and why it last restarted. "Last Reset Reason" is the first
+  # thing to check if the device has been misbehaving - it distinguishes a clean
+  # OTA reboot from a crash, a watchdog or a power cut.
+  - platform: debug
+    device:
+      name: "Device Info"
+    reset_reason:
+      name: "Last Reset Reason"
+
+# -----------------------------------------------------------------------------
+# Diagnostics
+# -----------------------------------------------------------------------------
+# Kept in permanently. TLS on a microcontroller is close enough to its limits
+# that knowing the numbers is worth the small cost, and both of these have
+# earned their place by explaining real failures.
+#
+# "Heap Largest Block" matters more than "Heap Free": a TLS handshake needs
+# 40-50KB in ONE contiguous piece, so a device with plenty free but badly
+# fragmented will still refuse connections. Healthy here is a figure that stays
+# roughly flat over days. A steady decline means something is fragmenting
+# internal memory and TLS will eventually stop working.
+#
+# Remove both this and the interval: block below if you would rather not have
+# the extra entities - nothing depends on them.
+debug:
+  update_interval: 30s
+
+# Reports how many of the HTTP server's session slots are occupied and which
+# socket descriptors they hold.
+#
+# Slots do leak: an event-source client that vanishes leaving a half-open socket
+# is never noticed, because the server only detects a dead session when a send
+# to it fails. With only a handful of usable slots, enough leaked ones would
+# mean the listener accepts a TCP connection and then has nowhere to put it -
+# which looks like an immediate connection reset, with nothing logged at all.
+#
+# lru_purge_enable in the forked component stops that being fatal by evicting
+# the least-recently-used session to make room. So seeing this count sit at its
+# maximum is expected and harmless; what would matter is connections failing
+# while it does.
+#
+# Requires log_session_stats() from the forked component.
+interval:
+  - interval: 30s
+    then:
+      - lambda: 'esphome::web_server_idf::log_session_stats();'
+
+sensor:
+  - platform: debug
+    free:
+      name: "Heap Free"
+    block:
+      name: "Heap Largest Block"
+    loop_time:
+      name: "Loop Time"
+
+# -----------------------------------------------------------------------------
+# Sensors
+# -----------------------------------------------------------------------------
+# Lever switches, one at each end of travel. The door physically presses the
+# lever, so ON genuinely means "the door is here" - no magnet-range guesswork.
+#
+# 50ms debounce is for ordinary mechanical contact bounce, which lasts a few
+# milliseconds. Nothing longer is needed - a lever either is or isn't pressed,
+# so there is no drifting in and out of range while the door sits still.
+binary_sensor:
+  - platform: gpio
+    id: door_fully_closed
+    name: "Garage Door Fully Closed"
+    device_class: garage_door
+    pin:
+      number: GPIO41
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_state:
+      - component.update: door_status
+
+  - platform: gpio
+    id: door_fully_open
+    name: "Garage Door Fully Open"
+    device_class: garage_door
+    pin:
+      number: GPIO42
+      mode: INPUT_PULLUP
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_state:
+      - component.update: door_status
+
+# -----------------------------------------------------------------------------
+# Relay
+# -----------------------------------------------------------------------------
+# Turning this on fires a 500ms pulse and switches itself back off - the same
+# as a brief press of the physical wall button. restore_mode ALWAYS_OFF makes
+# sure a power cut or reboot can never leave it energised, or trigger the door
+# on boot.
+#
+# The switch itself lives under Diagnostics because "Toggle" is a misleading
+# control for something that self-cancels. The button below is the real
+# interface - it reads as a single press, which is what actually happens.
+switch:
+  - platform: gpio
+    id: garage_door_relay
+    name: "Garage Door Relay"
+    # GPIO21, not GPIO40. GPIO39-42 are the S3's JTAG pins, and GPIO39/40 are
+    # pulled HIGH during download boot mode regardless of eFuse settings - which
+    # fired the relay and opened the door on every reboot and every OTA upload.
+    # That happens in ROM, long before any firmware runs, so no config can stop
+    # it. GPIO21 is a plain GPIO with no boot-time behaviour.
+    # The switches stay on 41/42: they're inputs, so a brief boot-time pull-up
+    # reads wrong for a moment and then corrects itself. Harmless.
+    pin: GPIO21
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - delay: 500ms
+      - switch.turn_off: garage_door_relay
+
+button:
+  - platform: template
+    id: door_press_button
+    name: "Press Button"
+    on_press:
+      - logger.log: "Web/app: button pressed"
+      - script.execute: fire_relay

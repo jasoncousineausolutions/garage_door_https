@@ -1,0 +1,12 @@
+# Copy to "cert-config" and edit. Used by make-cert.sh.
+# cert-config is gitignored; this example file is not.
+
+# Static IP of the device on your LAN. Must match device_ip in secrets.yaml.
+LOCAL_IP="192.168.1.50"
+
+# Public hostname if you reach the device from outside, otherwise leave empty.
+PUBLIC_HOST=""
+
+# Certificate lifetime in days. 3650 = 10 years. There is no renewal process,
+# so a long life is deliberate.
+DAYS=3650
