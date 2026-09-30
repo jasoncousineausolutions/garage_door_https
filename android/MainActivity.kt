@@ -76,7 +76,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import kotlin.math.roundToInt
 
-private const val APP_VERSION = "0.36"
+private const val APP_VERSION = "0.37"
 private const val TAG = "GarageDoor"
 
 private const val POLL_INTERVAL_MS = 1_000L
@@ -376,6 +376,8 @@ class MainActivity : ComponentActivity() {
         pollGeneration++
         activeBaseUrl = null
         lastPollSuccessAt = 0L
+        // Discard any status from a previous session - it may be hours old.
+        doorStatusText = "Unknown"
         log("$reason - starting to poll.")
         handler.post(pollRunnable)
     }
@@ -1116,11 +1118,21 @@ fun GarageDoorScreen(
             // while connected over Bluetooth, there is nothing live to show - so
             // the line is hidden rather than left showing something stale.
             if (config.hasWeb && !onBluetooth) {
+                // Only show a real status while actually connected. Otherwise the
+                // last value received is stale and we have no idea whether it is
+                // still true - reopening the app after leaving it mid-travel used
+                // to show "Partly Open" as though it were current.
+                //
+                // Grey rather than black, so an unconfirmed reading is visibly
+                // different from a live one at a glance.
+                val statusKnown = connectionMode == ConnectionMode.LOCAL ||
+                    connectionMode == ConnectionMode.INTERNET
                 Spacer(Modifier.height(24.dp))
                 Text(
-                    "Door Status: $doorStatusText",
+                    if (statusKnown) "Door Status: $doorStatusText" else "Door Status: Unknown",
                     fontSize = 20.sp,
-                    fontWeight = FontWeight.Bold
+                    fontWeight = FontWeight.Bold,
+                    color = if (statusKnown) Color.Unspecified else Color.Gray
                 )
             }
 
