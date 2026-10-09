@@ -76,7 +76,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import kotlin.math.roundToInt
 
-private const val APP_VERSION = "0.37"
+private const val APP_VERSION = "0.38"
 private const val TAG = "GarageDoor"
 
 private const val POLL_INTERVAL_MS = 1_000L
@@ -376,8 +376,14 @@ class MainActivity : ComponentActivity() {
         pollGeneration++
         activeBaseUrl = null
         lastPollSuccessAt = 0L
-        // Discard any status from a previous session - it may be hours old.
-        doorStatusText = "Unknown"
+        // Nothing is confirmed until a poll actually succeeds. Without this the
+        // mode persisted from a previous session, so reopening the app showed a
+        // live connection - and an enabled control - before anything had been
+        // reached. Status is cleared for the same reason: it may be hours old.
+        runOnUiThread {
+            connectionMode = ConnectionMode.NONE
+            doorStatusText = "Unknown"
+        }
         log("$reason - starting to poll.")
         handler.post(pollRunnable)
     }
@@ -386,6 +392,17 @@ class MainActivity : ComponentActivity() {
         if (!polling) return
         polling = false
         handler.removeCallbacks(pollRunnable)
+        // Once we stop checking we no longer know the connection is alive, so
+        // don't keep claiming it. Bluetooth is left alone - it has its own
+        // connection that polling has nothing to do with.
+        runOnUiThread {
+            if (connectionMode == ConnectionMode.LOCAL ||
+                connectionMode == ConnectionMode.INTERNET
+            ) {
+                connectionMode = ConnectionMode.NONE
+                doorStatusText = "Unknown"
+            }
+        }
         log("Stopped polling.")
     }
 
